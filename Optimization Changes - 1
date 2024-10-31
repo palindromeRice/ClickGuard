@@ -1,0 +1,728 @@
+import numpy as np
+import pandas as pd
+import re
+import math
+import spacy
+import os
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.feature_selection import RFE
+import tensorflow as tf
+from tensorflow.keras import backend as K
+from tensorflow.keras.callbacks import Callback, EarlyStopping, ModelCheckpoint
+from tensorflow.keras.layers import Input, Dense, LSTM, Bidirectional, GlobalMaxPooling1D, Conv1D, Concatenate, Layer, Lambda, BatchNormalization
+from tensorflow.keras.initializers import HeNormal
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import to_categorical
+from transformers import BertTokenizer, TFBertModel
+import keras_tuner as kt
+from sklearn.utils import class_weight
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, matthews_corrcoef, confusion_matrix
+import shutil
+import random
+from tensorflow.keras.layers import BatchNormalization
+from tensorflow.keras.initializers import HeNormal
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, matthews_corrcoef, confusion_matrix
+from tensorflow.keras.layers import Dropout
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.layers import Attention
+from sklearn.model_selection import RepeatedStratifiedKFold
+from tensorflow.keras.optimizers import AdamW
+from tensorflow.keras.layers import Input, Dense, LSTM, GlobalMaxPooling1D, Dropout, Concatenate, BatchNormalization
+from tensorflow.keras.layers import MultiHeadAttention
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import AdamW
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.initializers import HeNormal
+
+
+# NLP setup with spacy
+nlp = spacy.load("en_core_web_sm")
+
+# Set random seeds for reproducibility
+def set_random_seeds(seed_value=42):
+    np.random.seed(seed_value)
+    tf.random.set_seed(seed_value)
+    random.seed(seed_value)
+    os.environ['PYTHONHASHSEED'] = str(seed_value)
+
+# Applying the random seed settings
+set_random_seeds()
+
+# Load slang words
+def load_slang_words(filepath):
+    with open(filepath, 'r', encoding='utf-8') as file:
+        return [line.strip() for line in file.readlines()]
+
+# Function to extract features from text
+def extract_features(text, slang_words):
+    doc = nlp(text)
+    features = {
+        "num_characters": len(text),
+        "num_words": len(text.split()),
+        "num_question_marks": text.count('?'),
+        "num_exclamation_marks": text.count('!'),
+        "first_person_pronouns": len(re.findall(r'\b(I|you|he|she|it|we|they)\b', text, re.IGNORECASE)),
+        "second_person_pronouns": len(re.findall(r'\b(me|you|him|her|it|us|them)\b', text, re.IGNORECASE)),
+        "possessive_pronouns": len(re.findall(r'\b(mine|yours|his|hers|its|ours|theirs)\b', text, re.IGNORECASE)),
+        "nouns": sum(1 for token in doc if token.pos_ == "NOUN"),
+        "verbs": sum(1 for token in doc if token.pos_ == "VERB"),
+        "adjectives": sum(1 for token in doc if token.pos_ == "ADJ"),
+        "adverbs": sum(1 for token in doc if token.pos_ == "ADV"),
+        "pronouns": sum(1 for token in doc if token.pos_ == "PRON"),
+        "prepositions": sum(1 for token in doc if token.pos_ == "ADP"),
+        "punctuations": sum(1 for token in doc if token.pos_ == "PUNCT"),
+        "determiners": sum(1 for token in doc if token.pos_ == "DET"),
+        "stop_words": sum(1 for token in doc if token.is_stop),
+        "hashtags": text.count('#'),
+        "slang_words": sum(1 for word in text.split() if word.lower() in slang_words)
+    }
+    return features
+
+# Function to encode texts using BERT tokenizer
+def bert_encode(texts, max_len=64):  # Increased max_len to 64
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    input_ids, attention_masks, token_type_ids = [], [], []
+    for text in texts:
+        encoded = tokenizer.encode_plus(
+            text,
+            max_length=max_len,
+            add_special_tokens=True,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_token_type_ids=True
+        )
+        input_ids.append(encoded['input_ids'])
+        attention_masks.append(encoded['attention_mask'])
+        token_type_ids.append(encoded['token_type_ids'])
+    return np.array(input_ids), np.array(attention_masks), np.array(token_type_ids)
+
+
+
+# Load and preprocess data
+def load_and_preprocess_data(filepath, slang_words_path, num_features_to_select=10):
+    slang_words = load_slang_words(slang_words_path)
+    df = pd.read_csv(filepath)
+    labels = df['label'].values
+
+    input_ids, attention_masks, token_type_ids = bert_encode(df['text'].values)
+
+    # Extract text-based features
+    features = np.array([list(extract_features(text, slang_words).values()) for text in df['text']])
+
+    # Feature scaling and selection
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+    model = LogisticRegression(max_iter=1000, solver='saga')
+    rfe = RFE(model, n_features_to_select=num_features_to_select)
+    features_selected = rfe.fit_transform(features_scaled, labels)
+
+    return input_ids, attention_masks, token_type_ids, features_selected, labels
+
+
+# Prepare labels for training
+def prepare_labels_for_training(labels):
+    return labels  # Labels should be binary (0 or 1), not one-hot encoded
+
+# Custom BertLayer
+class BertLayer(Layer):
+    def __init__(self, **kwargs):
+        super(BertLayer, self).__init__(**kwargs)
+        self.bert = TFBertModel.from_pretrained('bert-base-uncased', trainable=True)
+
+    def call(self, inputs):
+        input_ids, attention_mask, token_type_ids = inputs
+        input_ids = tf.cast(input_ids, dtype=tf.int32)
+        token_type_ids = tf.cast(token_type_ids, dtype=tf.int32)
+
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+        sequence_output = outputs.last_hidden_state
+        pooled_output = tf.reduce_mean(sequence_output, axis=1)  # Aggregate embeddings
+        return sequence_output, pooled_output
+
+
+    @property
+    def trainable_variables(self):
+        return self.bert.trainable_variables
+
+# Custom Adaptive Weighting Layer
+class AdaptiveWeightingLayer(Layer):
+    def __init__(self, **kwargs):
+        super(AdaptiveWeightingLayer, self).__init__(**kwargs)
+        self.dense = Dense(2, activation='softmax')
+
+    def call(self, inputs):
+        x1, x2 = inputs
+        weights = self.dense(tf.concat([x1, x2], axis=-1))
+        weight1 = weights[:, 0:1]
+        weight2 = weights[:, 1:2]
+        weighted_output = (x1 * weight1) + (x2 * weight2)
+        return weighted_output
+
+class RefinedFeatureProcessingModel(tf.keras.layers.Layer):
+    def __init__(self, num_filters, kernel_size, lstm_units, num_cnn_layers, num_features, **kwargs):
+        super(RefinedFeatureProcessingModel, self).__init__(**kwargs)
+        self.num_features = num_features
+        self.dense_features = Dense(64, activation='relu', kernel_initializer=HeNormal(), name='dense_features')
+        self.batch_norm_dense = BatchNormalization()
+
+        self.conv_layers = [
+            Conv1D(filters=num_filters, kernel_size=kernel_size, activation='relu', kernel_initializer=HeNormal(), name=f'conv1d_{i}')
+            for i in range(num_cnn_layers)
+        ]
+        self.bi_lstm = Bidirectional(LSTM(units=lstm_units, return_sequences=True, activation='tanh', name='bi_lstm'))
+        self.self_attention = Attention()  # Self-Attention Layer
+        self.pooling = GlobalMaxPooling1D(name='global_max_pooling')
+        self.dense_2 = Dense(64, activation='relu', kernel_initializer=HeNormal(), name='dense_2')
+        self.batch_norm_dense2 = BatchNormalization()
+
+    def call(self, inputs):
+        features = tf.expand_dims(inputs, axis=-1)
+        features = tf.tile(features, [1, 10, 1])
+        processed_features = self.batch_norm_dense(self.dense_features(features))
+
+        for conv_layer in self.conv_layers:
+            processed_features = conv_layer(processed_features)
+
+        bi_lstm_output = self.bi_lstm(processed_features)
+        attn_output = self.self_attention([bi_lstm_output, bi_lstm_output])  # Apply self-attention
+        pooled_output = self.pooling(attn_output)
+        dense_output = self.batch_norm_dense2(self.dense_2(pooled_output))
+        return dense_output, tf.squeeze(features, axis=-1)
+
+
+def build_model(base_lr=1e-5, max_len=64, num_features=10):
+    num_classes = 1  # Adjusted for binary classification
+
+    # Inputs
+    bert_input_ids = Input(shape=(max_len,), dtype=tf.int32, name='bert_input_ids')
+    bert_attention_mask = Input(shape=(max_len,), dtype=tf.int32, name='bert_attention_mask')
+    bert_token_type_ids = Input(shape=(max_len,), dtype=tf.int32, name='bert_token_type_ids')
+    features_input = Input(shape=(num_features,), dtype=tf.float32, name='features_input')
+
+    # Pathway 1: BERT Layer followed by Multi-Head Attention and additional LSTM layers
+    bert_layer = BertLayer()
+    bert_sequence_output, pooled_bert_output = bert_layer([bert_input_ids, bert_attention_mask, bert_token_type_ids])
+
+    # Apply Multi-Head Attention (self-attention on BERT sequence output)
+    multihead_attention = MultiHeadAttention(num_heads=4, key_dim=64, name="multihead_attention")
+    attention_output = multihead_attention(bert_sequence_output, bert_sequence_output)
+
+    # Increased LSTM units and added another layer for complexity
+    x1 = LSTM(1024, return_sequences=True, recurrent_activation='sigmoid', activation='tanh',
+              kernel_initializer=HeNormal(), kernel_regularizer=l2(0.002))(attention_output)
+    x1 = Dropout(0.5)(x1)
+
+    # Additional LSTM layer
+    x2 = LSTM(512, return_sequences=False, recurrent_activation='sigmoid', activation='tanh',
+              kernel_initializer=HeNormal(), kernel_regularizer=l2(0.002))(x1)
+    x2 = Dropout(0.5)(x2)
+
+    x1_pooled = GlobalMaxPooling1D()(x1)
+
+    # Additional Dense layers with regularization for increased complexity
+    x3 = Dense(512, activation='relu', kernel_initializer=HeNormal(), kernel_regularizer=l2(0.002))(Concatenate()([pooled_bert_output, x1_pooled, x2]))
+    x3 = BatchNormalization()(x3)
+    x3 = Dropout(0.5)(x3)
+
+    # Pathway 2: Feature Processing remains the same
+    feature_model = RefinedFeatureProcessingModel(
+        num_filters=64,
+        kernel_size=2,
+        lstm_units=128,
+        num_cnn_layers=2,
+        num_features=num_features
+    )
+
+    # Process features with the refined model
+    conv_bi_lstm_output, processed_features = feature_model(features_input)
+    conv_bi_lstm_output = Lambda(lambda x: tf.expand_dims(x, axis=1))(conv_bi_lstm_output)
+
+    y1 = LSTM(128, return_sequences=True, recurrent_activation='sigmoid', activation='tanh',
+              kernel_initializer=HeNormal(), kernel_regularizer=l2(0.001))(conv_bi_lstm_output)
+    y1 = Dropout(0.4)(y1)
+
+    y2 = LSTM(128, return_sequences=False, recurrent_activation='sigmoid', activation='tanh',
+              kernel_initializer=HeNormal(), kernel_regularizer=l2(0.001))(y1)
+    y2 = Dropout(0.4)(y2)
+
+    y1_pooled = GlobalMaxPooling1D()(y1)
+
+    # Concatenate `processed_features`, `y1_pooled`, `y2`, and `bert_sequence_output` for y3
+    y3 = Dense(512, activation='relu', kernel_initializer=HeNormal(), kernel_regularizer=l2(0.001))(Concatenate()([processed_features, y1_pooled, y2, GlobalMaxPooling1D()(bert_sequence_output)]))
+    y3 = BatchNormalization()(y3)
+    y3 = Dropout(0.4)(y3)
+
+    # Ensure that both x3 and y3 have the same shape before passing to AdaptiveWeightingLayer
+    x3_aligned = Dense(512, activation='relu', kernel_initializer=HeNormal())(x3)
+    y3_aligned = Dense(512, activation='relu', kernel_initializer=HeNormal())(y3)
+
+    adaptive_weighting_layer = AdaptiveWeightingLayer(name='adaptive_weighting')
+    z = adaptive_weighting_layer([x3_aligned, y3_aligned])
+
+    # Final classification layer
+    final_classification = Dense(num_classes, activation='sigmoid', kernel_regularizer=l2(0.002))(z)
+
+    # Define the model with the specified inputs and final output
+    model = Model(
+        inputs=[bert_input_ids, bert_attention_mask, bert_token_type_ids, features_input],
+        outputs=final_classification
+    )
+
+    # Compile model with adjusted learning rate and optimizer
+    clr = CyclicLearningRate(base_lr=1e-6, max_lr=5e-4, step_size=2000, mode='triangular')
+    optimizer = AdamW(learning_rate=clr)
+
+    model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
+
+    return model
+
+
+
+
+
+# Cyclic Learning Rate Class with get_config method
+class CyclicLearningRate(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, base_lr, max_lr, step_size, mode='triangular', gamma=1.0):
+        super(CyclicLearningRate, self).__init__()
+        self.base_lr = base_lr
+        self.max_lr = max_lr
+        self.step_size = step_size
+        self.mode = mode
+        self.gamma = gamma
+
+    def __call__(self, step):
+        cycle = tf.floor(1 + step / (2 * self.step_size))
+        x = tf.abs(step / self.step_size - 2 * cycle + 1)
+        lr_delta = (self.max_lr - self.base_lr) * tf.maximum(0., (1 - x))
+
+        if self.mode == 'triangular':
+            return self.base_lr + lr_delta
+        elif self.mode == 'triangular2':
+            return self.base_lr + lr_delta / (2 ** (cycle - 1))
+        elif self.mode == 'exp_range':
+            return self.base_lr + lr_delta * (self.gamma ** step)
+
+    def get_config(self):
+        return {
+            "base_lr": self.base_lr,
+            "max_lr": self.max_lr,
+            "step_size": self.step_size,
+            "mode": self.mode,
+            "gamma": self.gamma
+        }
+
+def df_to_dataset(input_data, labels, batch_size=64, shuffle=True):
+    dataset = tf.data.Dataset.from_tensor_slices((
+        {
+            'bert_input_ids': input_data['input_ids'],
+            'bert_attention_mask': input_data['attention_mask'],
+            'bert_token_type_ids': input_data['token_type_ids'],
+            'features_input': input_data['features_input']
+        },
+        labels
+    ))
+
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=len(labels))
+
+    dataset = dataset.batch(batch_size)
+    return dataset
+
+import shutil
+
+def run_bayesian_optimization(train_input_ids, train_attention_masks, train_token_type_ids, train_features, train_labels):
+    def model_builder(hp):
+        base_lr = hp.Float('base_lr', min_value=1e-7, max_value=1e-4, sampling='LOG')
+        lstm_units = hp.Int('lstm_units', min_value=128, max_value=512, step=128)
+        dropout_rate = hp.Float('dropout_rate', min_value=0.2, max_value=0.5, step=0.1)
+        
+        # Pass base_lr to the build_model function
+        model = build_model(base_lr=base_lr)
+        
+        # Update LSTM units and dropout rate in model with the sampled hyperparameters
+        for layer in model.layers:
+            if layer.name == 'bi_lstm':
+                layer.units = lstm_units
+            if isinstance(layer, Dropout):
+                layer.rate = dropout_rate
+
+        return model
+
+    tuner_dir = '/content/drive/MyDrive/Version_2/Main/tuning_results'
+    project_name = 'bert_model_tuning'
+
+    if os.path.exists(tuner_dir):
+        shutil.rmtree(tuner_dir)
+
+    tuner = kt.BayesianOptimization(
+        model_builder,
+        objective='val_accuracy',
+        max_trials=3,
+        executions_per_trial=1,
+        directory=tuner_dir,
+        project_name=project_name
+    )
+
+    if len(train_labels.shape) == 1:
+        train_labels = to_categorical(train_labels, num_classes=2)
+
+    inputs = {
+        'bert_input_ids': np.array(train_input_ids),
+        'bert_attention_mask': np.array(train_attention_masks),
+        'bert_token_type_ids': np.array(train_token_type_ids),
+        'features_input': np.array(train_features)
+    }
+
+    tuner.search(inputs, train_labels, epochs=3, validation_split=0.2, verbose=1)
+    return tuner.get_best_hyperparameters()[0]
+
+
+def ensure_dir_exists(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+# Custom callback to save adaptive weights
+# Custom callback to save adaptive weights
+class SaveAdaptiveWeightsCallback(tf.keras.callbacks.Callback):
+    def __init__(self, fold_number=None, save_best_only=False):
+        super(SaveAdaptiveWeightsCallback, self).__init__()
+        self.weights_list = []
+        self.fold_number = fold_number
+        self.save_best_only = save_best_only
+        self.best_fold_weights = None
+
+    def on_epoch_end(self, epoch, logs=None):
+        adaptive_layer = [layer for layer in self.model.layers if isinstance(layer, AdaptiveWeightingLayer)][0]
+        adaptive_weights = adaptive_layer.dense.get_weights()[0]
+        self.weights_list.append(adaptive_weights)
+
+        if self.save_best_only:
+            if self.best_fold_weights is None or logs.get('val_accuracy') > max([x['val_accuracy'] for x in self.weights_list]):
+                self.best_fold_weights = adaptive_weights
+
+    def save_weights_to_csv(self, file_path='/content/drive/MyDrive/Version_2/Main/model_results/adaptive_weights.csv'):
+        ensure_dir_exists(os.path.dirname(file_path))
+        weights_df = pd.DataFrame(np.array(self.weights_list).reshape(len(self.weights_list), -1))
+        weights_df.to_csv(file_path, index=False)
+        print(f"Adaptive weights saved to {file_path}")
+
+    def save_best_weights_to_csv(self, file_path='/content/drive/MyDrive/Version_2/Main/model_results/adaptive_weights_best_fold.csv'):
+        if self.best_fold_weights is not None:
+            best_weights_df = pd.DataFrame(self.best_fold_weights.reshape(1, -1))
+            best_weights_df.to_csv(file_path, index=False)
+            print(f"Best adaptive weights saved to {file_path}")
+
+
+def save_bayesian_results(trial_results, best_lr):
+    bayesian_results_path = '/content/drive/MyDrive/Version_2/Main/model_results/bayesian_optimization_results.csv'
+    optimized_lr_path = '/content/drive/MyDrive/Version_2/Main/model_results/optimized_learning_rate.txt'
+    ensure_dir_exists(os.path.dirname(bayesian_results_path))
+
+    results_df = pd.DataFrame(trial_results)
+    results_df.to_csv(bayesian_results_path, index=False)
+    with open(optimized_lr_path, 'w') as f:
+        f.write(f"Best Optimized Learning Rate: {best_lr}")
+    print(f"Bayesian optimization results saved to {bayesian_results_path} and optimized learning rate to {optimized_lr_path}")
+
+
+def save_kfold_results(fold_metrics):
+    kfold_results_path = '/content/drive/MyDrive/Version_2/Main/model_results/kfold_results.csv'
+    ensure_dir_exists(os.path.dirname(kfold_results_path))
+
+    results_df = pd.DataFrame(fold_metrics)
+    results_df.to_csv(kfold_results_path, index=False)
+
+def save_best_fold_metrics(history, fold_number):
+    metrics_path = f'/content/drive/MyDrive/Version_2/Main/model_results/best_fold_{fold_number}_training_metrics.csv'
+    ensure_dir_exists(os.path.dirname(metrics_path))
+
+    metrics_df = pd.DataFrame(history.history)
+    metrics_df.to_csv(metrics_path, index=False)
+    print(f"Training metrics for best fold saved to {metrics_path}")
+
+def save_individual_fold_results(fold_metrics, fold_number):
+    individual_fold_path = f'/content/drive/MyDrive/Version_2/Main/model_results/individual_fold_results_{fold_number}.csv'
+    ensure_dir_exists(os.path.dirname(individual_fold_path))
+
+    results_df = pd.DataFrame([fold_metrics])
+    results_df.to_csv(individual_fold_path, index=False)
+
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, matthews_corrcoef, confusion_matrix
+import pandas as pd
+
+def calculate_and_save_extended_metrics(true_labels, predicted_labels, predicted_probs, file_path, description="Metrics"):
+    precision, recall, f1, _ = precision_recall_fscore_support(true_labels, predicted_labels, average='weighted')
+    
+    # Use `predicted_probs` directly for binary classification
+    roc_auc = roc_auc_score(true_labels, predicted_probs)
+    
+    mcc = matthews_corrcoef(true_labels, predicted_labels)
+    conf_matrix = confusion_matrix(true_labels, predicted_labels)
+
+    metrics_df = pd.DataFrame({
+        "Metric": ["Precision", "Recall", "F1 Score", "ROC AUC", "Matthews Correlation Coefficient"],
+        "Value": [precision, recall, f1, roc_auc, mcc]
+    })
+
+    metrics_df.to_csv(file_path, index=False)
+    print(f"{description} saved to {file_path}")
+
+    # Save confusion matrix
+    conf_matrix_df = pd.DataFrame(conf_matrix, columns=['Predicted Negative', 'Predicted Positive'],
+                                  index=['Actual Negative', 'Actual Positive'])
+    conf_matrix_df.to_csv(file_path.replace('.csv', '_confusion_matrix.csv'), index=True)
+
+
+
+def setup_logging(log_file='training.log'):
+    # Setting up logging configuration
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        filemode='a'  # Append mode
+    )
+
+    # Also log to console
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console.setFormatter(formatter)
+    logging.getLogger().addHandler(console)
+
+
+
+def k_fold_validation_with_extended_metrics(input_data, labels, base_lr, num_folds=5, batch_size=64, class_weights_dict=None):
+    kf = RepeatedStratifiedKFold(n_splits=num_folds, n_repeats=1, random_state=42)
+    fold_metrics = []
+    best_val_accuracy = 0
+    best_model_path = None
+    best_fold_history = None
+    best_fold_number = None
+    best_fold_true_labels = None
+    best_fold_predictions = None
+    best_fold_predicted_probs = None
+    best_fold_weights_callback = None  # Keep track of the best fold's weights callback
+
+    input_data_np = {key: np.array(data) for key, data in input_data.items()}
+    labels_int = labels  # Labels are already binary
+
+    for fold, (train_indices, val_indices) in enumerate(kf.split(input_data_np['input_ids'], labels_int)):
+        print(f'\n--- Fold {fold + 1} ---')
+        logging.info(f"Starting training for Fold {fold + 1}")
+
+        train_fold_input_data = {key: data[train_indices] for key, data in input_data_np.items()}
+        val_fold_input_data = {key: data[val_indices] for key, data in input_data_np.items()}
+        train_fold_labels = labels[train_indices]
+        val_fold_labels = labels[val_indices]
+
+        train_dataset = df_to_dataset(train_fold_input_data, train_fold_labels, batch_size=batch_size)
+        val_dataset = df_to_dataset(val_fold_input_data, val_fold_labels, batch_size=batch_size)
+
+        model = build_model(base_lr=base_lr)
+        adaptive_weights_callback = SaveAdaptiveWeightsCallback(fold_number=fold + 1)  # Save weights for this fold
+        early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+        model_checkpoint_path = f'/content/drive/MyDrive/Version_2/Main/model_results/best_model_fold_{fold+1}.keras'
+        ensure_dir_exists(os.path.dirname(model_checkpoint_path))
+        model_checkpoint = ModelCheckpoint(model_checkpoint_path, save_best_only=True, monitor='val_accuracy', mode='max')
+
+        # Print learning rate for the fold
+        print(f"Learning rate for Fold {fold + 1}: {base_lr}")
+        logging.info(f"Learning rate for Fold {fold + 1}: {base_lr}")
+
+        history = model.fit(
+            train_dataset,
+            validation_data=val_dataset,
+            epochs=10,
+            class_weight=class_weights_dict,
+            callbacks=[early_stopping, model_checkpoint, adaptive_weights_callback],
+            verbose=1
+        )
+
+        # Save adaptive weights for this fold
+        adaptive_weights_callback.save_weights_to_csv()
+
+        # Use thresholding for binary predictions instead of argmax
+        val_predictions = (model.predict(val_dataset) > 0.5).astype("int32").flatten()
+        val_true_labels = val_fold_labels.flatten()
+        val_predicted_probs = model.predict(val_dataset)
+
+        calculate_and_save_extended_metrics(
+            val_true_labels, val_predictions, val_predicted_probs,
+            file_path=f'/content/drive/MyDrive/Version_2/Main/model_results/metrics_fold_{fold+1}.csv',
+            description=f"Fold {fold+1} Metrics"
+        )
+
+        val_accuracy = max(history.history['val_accuracy'])
+        val_loss = min(history.history['val_loss'])
+
+        # Print validation accuracy for each fold
+        print(f"Validation accuracy for Fold {fold + 1}: {val_accuracy}")
+        logging.info(f"Validation accuracy for Fold {fold + 1}: {val_accuracy}")
+
+        fold_result = {
+            "fold": fold + 1,
+            "train_loss": min(history.history['loss']),
+            "train_accuracy": max(history.history['accuracy']),
+            "val_loss": val_loss,
+            "val_accuracy": val_accuracy
+        }
+
+        save_individual_fold_results(fold_result, fold + 1)
+
+        if val_accuracy > best_val_accuracy:
+            best_val_accuracy = val_accuracy
+            best_model_path = model_checkpoint_path
+            best_fold_history = history
+            best_fold_number = fold + 1
+            best_fold_true_labels = val_true_labels
+            best_fold_predictions = val_predictions
+            best_fold_predicted_probs = val_predicted_probs
+            best_fold_weights_callback = adaptive_weights_callback  # Track the best fold's weights
+
+        fold_metrics.append(fold_result)
+
+    save_kfold_results(fold_metrics)
+
+    # Save the best fold's adaptive weights
+    if best_fold_weights_callback is not None:
+        best_fold_weights_callback.save_weights_to_csv(file_path='/content/drive/MyDrive/Version_2/model_results/adaptive_weights_best_fold.csv')
+
+    if best_fold_history is not None:
+        save_best_fold_metrics(best_fold_history, best_fold_number)
+        calculate_and_save_extended_metrics(
+            best_fold_true_labels, best_fold_predictions, best_fold_predicted_probs,
+            file_path='/content/drive/MyDrive/Version_2/Main/model_results/best_fold_metrics.csv',
+            description="Best Fold Metrics"
+        )
+
+    # Print details of the best fold
+    print(f"\nBest Fold: {best_fold_number} with Validation Accuracy: {best_val_accuracy}")
+    logging.info(f"Best Fold: {best_fold_number} with Validation Accuracy: {best_val_accuracy}")
+
+    return np.mean([f["val_accuracy"] for f in fold_metrics]), best_model_path
+
+
+
+
+def model_builder(hp):
+    base_lr = hp.Float('base_lr', min_value=1e-6, max_value=1e-3, sampling='LOG')
+    model = build_model(base_lr=base_lr)
+    return model
+
+
+def load_best_hyperparameters_from_tuner(tuner_dir, project_name):
+    # Load the tuner object from the saved tuner directory
+    tuner = kt.BayesianOptimization(
+        model_builder,
+        objective='val_accuracy',
+        max_trials=3,
+        executions_per_trial=1,
+        directory=tuner_dir,
+        project_name=project_name
+    )
+    # Reload the best hyperparameters from the saved tuning results
+    best_hps = tuner.get_best_hyperparameters()[0]
+    return best_hps
+
+
+def save_final_model_metrics_with_extended(model, test_dataset, labels, save_path="/content/drive/MyDrive/Version_2/Main/model_results/final_model_metrics.csv"):
+    predictions = (model.predict(test_dataset) > 0.5).astype("int32").flatten()
+    true_labels = labels.flatten()
+    predicted_probs = model.predict(test_dataset)
+
+    calculate_and_save_extended_metrics(true_labels, predictions, predicted_probs, save_path, "Final Model Metrics")
+
+
+
+def main():
+    setup_logging()
+    ensure_dir_exists('/content/drive/MyDrive/Version_2/Main/model_results')
+
+    logging.info("Starting the training process...")
+
+    dataset_path = '/Cleaned_dataset.csv'
+    slang_words_path = '/content/drive/MyDrive/Final_MSSFAB/slangdictionary.txt'
+
+    # Ensure that the correct number of features (10) is selected
+    input_ids, attention_masks, token_type_ids, features, labels = load_and_preprocess_data(dataset_path, slang_words_path, num_features_to_select=10)
+    labels = prepare_labels_for_training(labels)  # Returns binary labels, not one-hot encoded
+
+    logging.info("Data has been successfully loaded and preprocessed.")
+
+    class_weights_vals = class_weight.compute_class_weight(class_weight='balanced', classes=np.unique(labels), y=labels)
+    class_weights_dict = dict(enumerate(class_weights_vals))
+
+    # Load the best hyperparameters from the pre-saved tuner directory
+    tuner_dir = '/content/drive/MyDrive/Version_1/Main/tuning_results'
+    project_name = 'bert_model_tuning'
+    best_hps = load_best_hyperparameters_from_tuner(tuner_dir, project_name)
+
+    # Extract the base learning rate from the best hyperparameters
+    base_lr = float(best_hps.get('base_lr'))
+    logging.info(f"Best hyperparameter loaded: base_lr={base_lr}")
+
+    input_data = {
+        'input_ids': input_ids,
+        'attention_mask': attention_masks,
+        'token_type_ids': token_type_ids,
+        'features_input': features
+    }
+
+    # Set batch size to 256, num_folds to 5, and epochs to 10
+    mean_val_accuracy, best_model_path = k_fold_validation_with_extended_metrics(
+        input_data=input_data,
+        labels=labels,
+        base_lr=base_lr,
+        num_folds=5,
+        batch_size=64,
+        class_weights_dict=class_weights_dict
+    )
+
+    logging.info(f"K-fold validation completed with mean validation accuracy: {mean_val_accuracy}")
+    logging.info(f"Best model saved at: {best_model_path}")
+
+    # Train on the entire dataset using the best-found hyperparameters
+    logging.info("Training the model on the entire dataset using the best-found hyperparameters.")
+
+    full_train_dataset = df_to_dataset(input_data, labels, batch_size=64, shuffle=True)
+
+    final_model = build_model(base_lr=base_lr, num_features=10)  # Make sure num_features=10
+
+    final_checkpoint_path = '/content/drive/MyDrive/Version_2/Main/model_results/final_trained_model.keras'
+    model_checkpoint = ModelCheckpoint(
+        filepath=final_checkpoint_path,
+        monitor='accuracy',
+        save_best_only=True,
+        save_weights_only=False,
+        verbose=1
+    )
+
+    optimizer = Adam(learning_rate=base_lr)
+    final_model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
+
+    history = final_model.fit(
+        full_train_dataset,
+        epochs=10,
+        class_weight=class_weights_dict,
+        callbacks=[model_checkpoint],
+        verbose=1
+    )
+
+    logging.info("Training on the entire dataset completed successfully.")
+
+    metrics_path = '/content/drive/MyDrive/Version_2/Main/model_results/final_full_training_metrics.csv'
+    pd.DataFrame(history.history).to_csv(metrics_path, index=False)
+    logging.info(f"Final training metrics saved to {metrics_path}")
+
+    final_model.save(final_checkpoint_path)
+    logging.info(f"Final trained model saved at {final_checkpoint_path}")
+
+
+if __name__ == "__main__":
+    main()
+
